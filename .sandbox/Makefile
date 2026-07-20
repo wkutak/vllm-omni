@@ -34,8 +34,14 @@ SUPER_FP8_MODEL ?= $(MODEL_DIR)/cosmos3-super/fp8
 SUPER_T2I_BF16_MODEL ?= $(MODEL_DIR)/super-t2i/bf16
 SUPER_T2I_FP8_MODEL ?= $(MODEL_DIR)/super-t2i/fp8
 
+SUPER_T2I_DISTILLED_BF16_MODEL ?= $(MODEL_DIR)/super-t2i-distilled/bf16
+SUPER_T2I_DISTILLED_FP8_MODEL ?= $(MODEL_DIR)/super-t2i-distilled/fp8
+
 SUPER_I2V_BF16_MODEL ?= $(MODEL_DIR)/super-i2v/bf16
 SUPER_I2V_FP8_MODEL ?= $(MODEL_DIR)/super-i2v/fp8
+
+SUPER_I2V_DISTILLED_BF16_MODEL ?= $(MODEL_DIR)/super-i2v-distilled/bf16
+SUPER_I2V_DISTILLED_FP8_MODEL ?= $(MODEL_DIR)/super-i2v-distilled/fp8
 
 VLLM_OMNI_DIR ?= $(SCRATCH_SPACE)/dev/vllm-omni-cosmos-genai-nim/
 
@@ -160,3 +166,42 @@ infer-t2i:
 			--model $(SUPER_T2I_FP8_MODEL) \
 			--prompt "A photorealistic red fox sitting in a snowy forest at dawn." \
 			--output .sandbox/overlay/infer/super_t2i_fp8_$(shell date +%Y%m%d_%H%M%S).png'
+
+infer-t2i-distilled:
+	docker run -it --rm \
+		--name $(IMAGE_NAME)-serve \
+		$(GPU_FLAG) \
+		--ipc host \
+		-p $(HOST_PORT):8000 \
+		--ulimit memlock=-1 \
+		--ulimit stack=67108864 \
+		-e HF_TOKEN \
+		-e HUGGING_FACE_HUB_TOKEN="$(HF_TOKEN)" \
+		-u 0:0 \
+		-e NGC_API_KEY=$(NGC_API_KEY) \
+		$(MOUNTS) \
+		$(IMAGE_NAME):$(IMAGE_VERSION) \
+		bash -c 'cd $(VLLM_OMNI_DIR) && \
+		python .sandbox/overlay/cosmos3_infer_t2i_distilled.py \
+			--model $(SUPER_T2I_DISTILLED_FP8_MODEL) \
+			--prompt "A photorealistic red fox sitting in a snowy forest at dawn." \
+			--output .sandbox/overlay/infer/super_t2i_distilled_fp8_$(shell date +%Y%m%d_%H%M%S).png'
+
+infer-i2v-distilled:
+	docker run -it --rm \
+		--name $(IMAGE_NAME)-serve \
+		$(GPU_FLAG) \
+		--ipc host \
+		-p $(HOST_PORT):8000 \
+		--ulimit memlock=-1 \
+		--ulimit stack=67108864 \
+		-e HF_TOKEN \
+		-e HUGGING_FACE_HUB_TOKEN="$(HF_TOKEN)" \
+		-u 0:0 \
+		-e NGC_API_KEY=$(NGC_API_KEY) \
+		$(MOUNTS) \
+		$(IMAGE_NAME):$(IMAGE_VERSION) \
+		bash -c 'cd $(VLLM_OMNI_DIR) && \
+		python .sandbox/overlay/cosmos3_infer_i2v_distilled.py \
+			--model $(SUPER_I2V_DISTILLED_FP8_MODEL) \
+			--output .sandbox/overlay/infer/super_i2v_distilled_fp8_$(shell date +%Y%m%d_%H%M%S).mp4'

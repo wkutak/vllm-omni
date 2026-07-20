@@ -1,34 +1,50 @@
 #!/usr/bin/env python3
-"""Standalone offline Cosmos3 **text-to-image** inference via vllm-omni.
+"""Standalone offline Cosmos3 **distilled text-to-image** inference via vllm-omni.
 
-Sibling of ``cosmos3_infer.py`` (which does T2V/I2V). This one drives the
-vllm-omni ``Omni`` engine for a single text-to-image generation and writes a PNG,
-so you can sanity-check an FP8 super-t2i export against its bf16 baseline.
+Sibling of ``cosmos3_infer_t2i.py``, specialized for the 4-step DMD2 distilled
+student (``nvidia/Cosmos3-Super-Text2Image-4Step`` -> ``super-t2i-distilled``).
+Same T2I plumbing (``modalities=["image"]`` flips the pipeline into T2I mode,
+forces latent T=1, applies the T2I system prompt); only the sampling defaults
+differ, matching the distilled model's calibration in ``models.mk``:
 
-What makes it T2I (vs T2V with one frame): the pipeline detects t2i from the
-**prompt modalities**, not the frame count — ``_is_t2i_request`` returns
-``"image" in prompt["modalities"]`` (pipeline_cosmos3.py:740). So the prompt
-payload carries ``"modalities": ["image"]`` (as in the bagel/lance examples).
-Once detected, the pipeline forces the latent T-dim to 1, applies the T2I system
-prompt + image-resolution template, and the T2I guidance_interval.
+    num_inference_steps = 4        (vs 50 for super-t2i)
+    guidance_scale      = 1.0      (DMD2 is CFG-free; guidance>1 does nothing)
 
-FP8 is auto-detected from the checkpoint's ``transformer/config.json``
-``quantization_config`` (``quant_method=modelopt``), so there's no
-``--quantization`` flag — point ``--model`` at the FP8 export or the bf16 dir.
+Use it to sanity-check the distilled bf16 checkpoint before quantizing, and for
+bf16-vs-fp8 A/B after.
 
-Defaults mirror the super-t2i calibration shape set in
-``pipeline_checkpoints/models.mk`` (num_frames=1, 720x1280, 50 steps,
-guidance 6.0, flow_shift 3.0) so the check runs at the shape the FP8 scales were
-calibrated for. Override any of them on the CLI. Example:
+IMPORTANT — scheduler caveat
+----------------------------
+vllm-omni's ``Cosmos3OmniDiffusersPipeline`` hardcodes ``UniPCMultistepScheduler``
+(``diffusion/models/cosmos3/pipeline_cosmos3.py``); it does NOT yet drive the
+distilled model's ``FlowMatchEulerDiscreteScheduler`` fixed 4-step **stochastic
+(SDE)** sampler (explicit ``fixed_step_sampler_config.t_list`` sigmas). So:
 
-    # FP8 checkpoint:
-    python .sandbox/overlay/cosmos3_infer_t2i.py \
-        --model /home/scratch.wkutak_other_1/dev/cosmos3/quantization/data/super-t2i/fp8 \
+  * This script is valid for **bf16-vs-fp8 A/B** — both run through the same UniPC
+    path, so the quantization delta is measured cleanly.
+  * It will **not** reproduce the reference 4-step DMD2 image quality until
+    vllm-omni gains distilled-scheduler support. For a faithful reference image,
+    drive the diffusers ``Cosmos3OmniPipeline``/distilled modular pipeline directly
+    (FlowMatchEuler + t_list sigmas), which is a separate script.
+
+The cache backend does read ``is_distilled`` from ``model_index.json``
+(``cache_dit_backend.py``: ``has_separate_cfg = not pipeline.is_distilled``), so
+CFG handling on the cache path already reflects the distilled (single-stream) model.
+
+FP8 is auto-detected from ``transformer/config.json`` (``quant_method=modelopt``),
+so point ``--model`` at the fp8 export or the bf16 dir — no ``--quantization`` flag.
+
+Example:
+
+    # bf16 baseline:
+    python .sandbox/overlay/cosmos3_infer_t2i_distilled.py \
+        --model /home/scratch.wkutak_other_1/dev/cosmos3/quantization/data/super-t2i-distilled/bf16 \
         --prompt "A photorealistic red fox sitting in a snowy forest at dawn." \
-        --output /tmp/super_t2i_fp8.png
+        --output /tmp/super_t2i_distilled_bf16.png
 
-    # bf16 baseline for A/B:
-    python .sandbox/overlay/cosmos3_infer_t2i.py --model .../super-t2i/bf16 --output /tmp/super_t2i_bf16.png
+    # fp8 A/B (after quantize-super-t2i-distilled):
+    python .sandbox/overlay/cosmos3_infer_t2i_distilled.py \
+        --model .../super-t2i-distilled/fp8 --output /tmp/super_t2i_distilled_fp8.png
 """
 
 from __future__ import annotations
@@ -40,12 +56,12 @@ from pathlib import Path
 
 import numpy as np
 
-# T2I-specific defaults, aligned with super-t2i's models.mk calibration and the
-# pipeline's t2i serving constants (pipeline_cosmos3.py: flow_shift=3.0, 50 steps).
-_T2I_DEFAULT_FLOW_SHIFT = 3.0
 _OMNI_DEFAULT_MAX_SEQUENCE_LENGTH = 4096
 
-_DEFAULT_MODEL = "/home/scratch.wkutak_other_1/dev/cosmos3/quantization/data/super-t2i/fp8"
+# Distilled defaults — mirror models.mk (STEPS=4, GUID=1.0).
+_DEFAULT_MODEL = "/home/scratch.wkutak_other_1/dev/cosmos3/quantization/data/super-t2i-distilled/bf16"
+_DEFAULT_STEPS = 4
+_DEFAULT_GUIDANCE = 1.0
 _DEFAULT_PROMPT = (
     "A photorealistic red fox sitting upright in a snowy pine forest at dawn, "
     "soft golden light, fine fur detail, shallow depth of field."
@@ -63,20 +79,25 @@ def parse_args() -> argparse.Namespace:
     )
     p.add_argument("--model", default=_DEFAULT_MODEL,
                    help="Checkpoint dir (fp8 or bf16). FP8 is auto-detected from config.json.")
+    p.add_argument("--model-class-name", default="Cosmos3OmniDiffusersPipeline",
+                   help="vllm-omni pipeline class (only Cosmos3OmniDiffusersPipeline is registered).")
     p.add_argument("--input", type=Path, default=None,
                    help="Optional request JSON. CLI flags override its values.")
-    p.add_argument("--output", type=Path, default=Path("/tmp/cosmos3_t2i.png"))
+    p.add_argument("--output", type=Path, default=Path("/tmp/cosmos3_t2i_distilled.png"))
 
     # prompt
     p.add_argument("--prompt", default=None)
     p.add_argument("--negative-prompt", default="")
 
-    # sampling shape — default None so value is CLI > input JSON > t2i default.
+    # sampling shape — default None so value is CLI > input JSON > distilled default.
     p.add_argument("--height", type=int, default=None)
     p.add_argument("--width", type=int, default=None)
     p.add_argument("--num-inference-steps", type=int, default=None)
     p.add_argument("--guidance-scale", type=float, default=None)
-    p.add_argument("--flow-shift", type=float, default=None)
+    p.add_argument("--flow-shift", type=float, default=None,
+                   help="UniPC flow_shift (vllm-omni path). Unset by default: the distilled "
+                        "model uses FlowMatchEuler shift=1.0, so leave it off unless A/B'ing "
+                        "the UniPC serving path explicitly.")
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--max-sequence-length", type=int, default=_OMNI_DEFAULT_MAX_SEQUENCE_LENGTH)
     p.add_argument("--no-system-prompt", action="store_true",
@@ -99,7 +120,7 @@ def merge_input_json(args: argparse.Namespace) -> dict:
         data = json.loads(Path(args.input).read_text())
         unknown = sorted(k for k in data if k not in _SUPPORTED_INPUT_KEYS)
         if unknown:
-            print(f"[warn] ignoring unrecognized input keys (t2i): {unknown}")
+            print(f"[warn] ignoring unrecognized input keys (t2i-distilled): {unknown}")
         base = {k: v for k, v in data.items() if k in _SUPPORTED_INPUT_KEYS}
     return base
 
@@ -115,9 +136,9 @@ def main() -> None:
     negative_prompt = args.negative_prompt or base.get("negative_prompt") or ""
     height = pick(args.height, "height", 720)
     width = pick(args.width, "width", 1280)
-    num_steps = pick(args.num_inference_steps, "num_inference_steps", 50)
-    guidance = pick(args.guidance_scale, "guidance_scale", 6.0)
-    flow_shift = pick(args.flow_shift, "flow_shift", _T2I_DEFAULT_FLOW_SHIFT)
+    num_steps = pick(args.num_inference_steps, "num_inference_steps", _DEFAULT_STEPS)
+    guidance = pick(args.guidance_scale, "guidance_scale", _DEFAULT_GUIDANCE)
+    flow_shift = pick(args.flow_shift, "flow_shift", None)  # distilled: no flow_shift by default
 
     import torch
     from vllm_omni.entrypoints.omni import Omni
@@ -125,17 +146,21 @@ def main() -> None:
 
     print("=" * 60)
     print(f" model            = {args.model}")
-    print(f" mode             = T2I (modalities=['image'], num_frames=1)")
+    print(f" mode             = T2I distilled (modalities=['image'], num_frames=1)")
     print(f" shape            = {width}x{height}, {num_steps} steps")
     print(f" guidance/flow    = {guidance} / {flow_shift}, seed={args.seed}")
     print(f" engine           = tp{args.tp} cfg{args.cfg} ulysses{args.ulysses} "
           f"{'compile' if args.torch_compile else 'eager'}")
+    if guidance != 1.0:
+        print(" [warn] distilled DMD2 is CFG-free; guidance_scale != 1.0 has no effect on it.")
+    print(" [note] vllm-omni cosmos3 uses UniPC, not the distilled 4-step FlowMatchEuler SDE;")
+    print("        valid for bf16-vs-fp8 A/B, not a faithful reference-quality image.")
     print("=" * 60)
 
     t0 = time.time()
     omni = Omni(
         model=args.model,
-        model_class_name="Cosmos3OmniDiffusersPipeline",
+        model_class_name=args.model_class_name,
         trust_remote_code=True,
         enforce_eager=not args.torch_compile,
         tensor_parallel_size=args.tp,
@@ -146,13 +171,20 @@ def main() -> None:
     )
     print(f"[load] Omni engine ready in {time.time() - t0:.1f}s")
 
-    # "modalities": ["image"] is what flips the pipeline into T2I mode
-    # (_is_t2i_request); it also routes the image-output stage in Omni.generate.
+    # "modalities": ["image"] flips the pipeline into T2I mode (_is_t2i_request)
+    # and routes the image-output stage in Omni.generate.
     prompt_payload: dict[str, object] = {
         "prompt": prompt,
         "negative_prompt": negative_prompt or None,
         "modalities": ["image"],
     }
+
+    extra_args: dict[str, object] = {
+        "max_sequence_length": args.max_sequence_length,
+        "use_system_prompt": not args.no_system_prompt,
+    }
+    if flow_shift is not None:
+        extra_args["flow_shift"] = flow_shift
 
     gen_params = OmniDiffusionSamplingParams(
         height=height,
@@ -162,11 +194,7 @@ def main() -> None:
         guidance_scale=guidance,
         seed=args.seed,
         max_sequence_length=args.max_sequence_length,
-        extra_args={
-            "flow_shift": flow_shift,
-            "max_sequence_length": args.max_sequence_length,
-            "use_system_prompt": not args.no_system_prompt,
-        },
+        extra_args=extra_args,
     )
 
     if torch.cuda.is_available():

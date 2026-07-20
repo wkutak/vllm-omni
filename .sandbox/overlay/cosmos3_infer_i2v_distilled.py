@@ -1,29 +1,40 @@
 #!/usr/bin/env python3
-"""Standalone offline Cosmos3 **image-to-video** (i2v) inference via vllm-omni.
+"""Standalone offline Cosmos3 **distilled image-to-video** (i2v) inference via vllm-omni.
 
-Sibling of `cosmos3_infer.py` (T2V/I2V) and `cosmos3_infer_t2i.py` (T2I). This one
-is specialised for i2v: it fetches a conditioning image (default: the Cosmos
-`car_driving.jpg`), feeds it as `multi_modal_data={"image": ...}`, and generates a
-video continuing from it, writing an MP4. Use it to sanity-check a super-i2v FP8
-export against its bf16 baseline.
+Sibling of `cosmos3_infer_i2v.py`, specialized for the 4-step DMD2 distilled i2v
+student (`nvidia/Cosmos3-Super-Image2Video-4Step` -> `super-i2v-distilled`). Same i2v
+plumbing (a conditioning image is fed as `multi_modal_data={"image": ...}`, VAE-encoded
+as a clean first frame and re-injected each denoise step; video output -> MP4); only the
+sampling defaults differ, matching the distilled model's calibration in `models.mk`:
 
-How it's i2v (vs t2i): the pipeline detects i2v from the presence of a conditioning
-**image** with a **video** output modality (default) — the image is VAE-encoded as a
-clean first frame and re-injected each denoise step (`_prepare_latents_i2v`). t2i
-would instead pass `modalities=["image"]`; i2v does not.
+    num_inference_steps = 4        (vs 35 for super-i2v)
+    guidance_scale      = 1.0      (DMD2 is CFG-free; guidance>1 does nothing)
 
-FP8 is auto-detected from the checkpoint's `transformer/config.json`
-`quantization_config`, so there is no `--quantization` flag — point `--model` at the
-FP8 export or the bf16 dir.
+Use it to sanity-check the distilled i2v bf16 checkpoint, and for bf16-vs-fp8 A/B after.
+
+Serving support
+---------------
+The vllm-omni distilled patch (`diffusion/models/cosmos3/pipeline_cosmos3.py`) DOES cover
+i2v: on a distilled checkpoint it loads the `FlowMatchEulerDiscreteScheduler`, drives the
+fixed 4-step stochastic (SDE) sigmas in the shared `_run_diffusion`, and disables CFG
+(`do_classifier_free_guidance` is False) — all of which apply to the i2v path (it flows
+through the same denoise). So this script runs the true distilled sampler, not UniPC.
+(It requires the patched `pipeline_cosmos3.py`; without it the checkpoint falls back to
+UniPC and the run is only valid for bf16-vs-fp8 A/B, not reference quality.)
+
+FP8 is auto-detected from `transformer/config.json` (`quant_method=modelopt`), so point
+`--model` at the fp8 export or the bf16 dir — no `--quantization` flag.
 
 Example:
-    python .sandbox/overlay/cosmos3_infer_i2v.py \
-        --model /home/scratch.wkutak_other_1/dev/cosmos3/quantization/data/super-i2v/fp8 \
-        --output /tmp/super_i2v_fp8.mp4
-    # bf16 baseline (same image/seed):
-    python .sandbox/overlay/cosmos3_infer_i2v.py --model .../super-i2v/bf16 --output /tmp/super_i2v_bf16.mp4
+    # bf16 baseline:
+    python .sandbox/overlay/cosmos3_infer_i2v_distilled.py \
+        --model /home/scratch.wkutak_other_1/dev/cosmos3/quantization/data/super-i2v-distilled/bf16 \
+        --output /tmp/super_i2v_distilled_bf16.mp4
+    # fp8 A/B (after quantize-super-i2v-distilled):
+    python .sandbox/overlay/cosmos3_infer_i2v_distilled.py \
+        --model .../super-i2v-distilled/fp8 --output /tmp/super_i2v_distilled_fp8.mp4
     # your own image / prompt:
-    python .sandbox/overlay/cosmos3_infer_i2v.py --image /path/to/frame0.jpg --prompt "..."
+    python .sandbox/overlay/cosmos3_infer_i2v_distilled.py --image /path/to/frame0.jpg --prompt "..."
 """
 
 from __future__ import annotations
@@ -36,21 +47,16 @@ from pathlib import Path
 
 import numpy as np
 
-# NOTE: flow_shift is NOT forced by default. For image i2v the pipeline is not v2v
-# (`is_v2v` needs a *video* input), so it uses the checkpoint's native shift
-# (`_engine_init_flow_shift`, = super-i2v's flow_shift=1.0). Forcing the V2V value
-# (COSMOS3_V2V_DEFAULT_FLOW_SHIFT=10.0) over-shifts the sigma schedule and starves the
-# low-noise / fine-detail steps -> grainy video. Only pass --flow-shift to A/B the UniPC path.
 _OMNI_DEFAULT_MAX_SEQUENCE_LENGTH = 4096
 
-_DEFAULT_MODEL = "/home/scratch.wkutak_other_1/dev/cosmos3/quantization/data/super-i2v/fp8"
+# Distilled defaults — mirror models.mk (STEPS=4, GUID=1.0).
+_DEFAULT_MODEL = "/home/scratch.wkutak_other_1/dev/cosmos3/quantization/data/super-i2v-distilled/bf16"
+_DEFAULT_STEPS = 4
+_DEFAULT_GUIDANCE = 1.0
 _DEFAULT_IMAGE_URL = (
     "https://raw.githubusercontent.com/NVIDIA/cosmos/refs/heads/main/cookbooks/"
     "cosmos3/generator/audiovisual/assets/images/image2video/car_driving.jpg"
 )
-# _DEFAULT_IMAGE_URL = (
-#     "/home/scratch.wkutak_other/dev/vllm-omni-cosmos-genai-nim/.sandbox/overlay/infer/super_t2i_distilled_fp8_20260715_151725.png"
-# )
 _DEFAULT_PROMPT = (
     "A car drives forward along the road, smooth continuous camera motion, "
     "consistent lighting and scenery, photorealistic."
@@ -75,9 +81,11 @@ def parse_args() -> argparse.Namespace:
     )
     p.add_argument("--model", default=_DEFAULT_MODEL,
                    help="Checkpoint dir (fp8 or bf16). FP8 auto-detected from config.json.")
+    p.add_argument("--model-class-name", default="Cosmos3OmniDiffusersPipeline",
+                   help="vllm-omni pipeline class (only Cosmos3OmniDiffusersPipeline is registered).")
     p.add_argument("--image", default=_DEFAULT_IMAGE_URL,
                    help="Conditioning first-frame image (local path or http(s) URL).")
-    p.add_argument("--output", type=Path, default=Path("/tmp/cosmos3_i2v.mp4"))
+    p.add_argument("--output", type=Path, default=Path("/tmp/cosmos3_i2v_distilled.mp4"))
 
     p.add_argument("--prompt", default=_DEFAULT_PROMPT)
     p.add_argument("--negative-prompt", default="")
@@ -86,13 +94,13 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--height", type=int, default=720)
     p.add_argument("--width", type=int, default=1280)
     p.add_argument("--num-frames", type=int, default=93)
-    p.add_argument("--num-inference-steps", type=int, default=35)
-    p.add_argument("--guidance-scale", type=float, default=6.0)
+    p.add_argument("--num-inference-steps", type=int, default=_DEFAULT_STEPS)
+    p.add_argument("--guidance-scale", type=float, default=_DEFAULT_GUIDANCE)
     p.add_argument("--fps", type=float, default=24.0)
     p.add_argument("--flow-shift", type=float, default=None,
-                   help="UniPC flow_shift override. Unset by default so the pipeline uses the "
-                        "checkpoint's native i2v shift (1.0); 10.0 is the V2V value and over-shifts "
-                        "i2v -> grainy. Only set to A/B the UniPC schedule explicitly.")
+                   help="UniPC flow_shift (vllm-omni video path). Unset by default: the distilled "
+                        "model uses FlowMatchEuler shift=1.0, so leave it off unless A/B'ing the "
+                        "UniPC serving path explicitly.")
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--max-sequence-length", type=int, default=_OMNI_DEFAULT_MAX_SEQUENCE_LENGTH)
     p.add_argument("--no-system-prompt", action="store_true")
@@ -116,18 +124,21 @@ def main() -> None:
 
     print("=" * 60)
     print(f" model            = {args.model}")
-    print(f" mode             = I2V (multi_modal_data image, video output)")
+    print(f" mode             = I2V distilled (multi_modal_data image, video output)")
     print(f" image            = {args.image}  ({image.width}x{image.height})")
     print(f" shape            = {args.width}x{args.height}, {args.num_frames} frames, {args.num_inference_steps} steps")
     print(f" guidance/flow    = {args.guidance_scale} / {args.flow_shift}, fps={args.fps}, seed={args.seed}")
     print(f" engine           = tp{args.tp} cfg{args.cfg} ulysses{args.ulysses} "
           f"{'compile' if args.torch_compile else 'eager'}")
+    if args.guidance_scale != 1.0:
+        print(" [warn] distilled DMD2 is CFG-free; guidance_scale != 1.0 has no effect on it.")
+    print(" [note] requires the patched pipeline_cosmos3.py (distilled FlowMatchEuler 4-step SDE).")
     print("=" * 60)
 
     t0 = time.time()
     omni = Omni(
         model=args.model,
-        model_class_name="Cosmos3OmniDiffusersPipeline",
+        model_class_name=args.model_class_name,
         trust_remote_code=True,
         enforce_eager=not args.torch_compile,
         tensor_parallel_size=args.tp,
